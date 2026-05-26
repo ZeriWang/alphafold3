@@ -26,6 +26,12 @@ dependencies = [
     "zstandard",
 ]
 
+[project.optional-dependencies]
+cue = [
+    "cuequivariance-jax==0.10.0",
+    "cuequivariance-ops-jax-cu12==0.10.0",
+]
+
 [dependency-groups]
 dev = [
     "pytest>=6.0",

@@ -63,7 +63,9 @@
       "triangle_multiplication_outgoing": {
         "equation": "ikc,jkc->ijc",
         "use_glu_kernel": true
-      }
+      },
+      "use_cue_triangle_attention": false,
+      "use_cue_triangle_multiplication": false
     },
     "per_atom_conditioning": {
       "atom_transformer": {
@@ -106,7 +108,9 @@
         "triangle_multiplication_outgoing": {
           "equation": "ikc,jkc->ijc",
           "use_glu_kernel": true
-        }
+        },
+        "use_cue_triangle_attention": false,
+        "use_cue_triangle_multiplication": false
       }
     }
   },
@@ -176,7 +180,9 @@
         "triangle_multiplication_outgoing": {
           "equation": "ikc,jkc->ijc",
           "use_glu_kernel": true
-        }
+        },
+        "use_cue_triangle_attention": false,
+        "use_cue_triangle_multiplication": false
       }
     },
     "diffusion": {

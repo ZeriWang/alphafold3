@@ -11,6 +11,7 @@
 """Haiku modules for the Diffuser model."""
 
 from collections.abc import Sequence
+import importlib
 from typing import Literal
 
 from alphafold3.common import base_config
@@ -22,6 +23,66 @@ import haiku as hk
 import jax
 import jax.numpy as jnp
 import tokamax
+
+
+def _require_cuequivariance_jax(*, flag: str):
+  """Imports optional cuEquivariance JAX kernels for an enabled flag."""
+  try:
+    return importlib.import_module('cuequivariance_jax')
+  except (ImportError, OSError) as err:
+    raise ImportError(
+        f'{flag}=True requires cuequivariance-jax and the matching '
+        'cuequivariance JAX CUDA ops package. If they are installed, ensure '
+        'the CUDA shared libraries from the Python environment take precedence '
+        'on LD_LIBRARY_PATH. Disable the flag to use the default Pairformer '
+        'triangle implementation.'
+    ) from err
+
+
+def _cue_triangle_direction(
+    equation: Literal['ikc,jkc->ijc', 'kjc,kic->ijc'],
+) -> Literal['outgoing', 'incoming']:
+  return {
+      'ikc,jkc->ijc': 'outgoing',
+      'kjc,kic->ijc': 'incoming',
+  }[equation]
+
+
+def _cue_layer_norm_params(name: str, act: jax.Array):
+  """Gets parameters with the same layout as hm.LayerNorm."""
+  dtype = (
+      jnp.float32 if act.dtype in (jnp.bfloat16, jnp.float16) else act.dtype
+  )
+  channels = act.shape[-1]
+  with hk.name_scope(name):
+    scale = hk.get_parameter(
+        'scale',
+        shape=(channels,),
+        dtype=dtype,
+        init=hk.initializers.Constant(1.0),
+    )
+    offset = hk.get_parameter(
+        'offset',
+        shape=(channels,),
+        dtype=dtype,
+        init=hk.initializers.Constant(0.0),
+    )
+  return scale, offset
+
+
+def _cue_triangle_attention_inputs(q, k, v, bias, mask):
+  """Converts GridSelfAttention tensors to cuEq triangle attention layout."""
+  q = jnp.transpose(q, (0, 2, 1, 3))[None]
+  k = jnp.transpose(k, (0, 2, 1, 3))[None]
+  v = jnp.transpose(v, (0, 2, 1, 3))[None]
+  bias = bias[None, None]
+  mask = jnp.asarray(mask, dtype=jnp.bool_)[None]
+  return q, k, v, bias, mask
+
+
+def _cue_triangle_attention_output(weighted_avg):
+  """Converts cuEq triangle attention output to GridSelfAttention layout."""
+  return jnp.transpose(weighted_avg[0], (0, 2, 1, 3))
 
 
 def get_shard_size(
@@ -242,6 +303,102 @@ class GridSelfAttention(hk.Module):
     return act
 
 
+class CueGridSelfAttention(hk.Module):
+  """GridSelfAttention using cuEq for its triangle attention core."""
+
+  def __init__(
+      self,
+      config: GridSelfAttention.Config,
+      global_config: model_config.GlobalConfig,
+      transpose: bool,
+      *,
+      name: str,
+  ):
+    super().__init__(name=name)
+    self.config = config
+    self.global_config = global_config
+    self.transpose = transpose
+
+  @hk.transparent
+  def _attention(
+      self,
+      act,
+      mask,
+      bias,
+  ):
+    num_channels = act.shape[-1]
+    assert num_channels % self.config.num_head == 0
+    qkv_dim = max(num_channels // self.config.num_head, 16)
+    qkv_shape = (self.config.num_head, qkv_dim)
+    q = hm.Linear(
+        qkv_shape, use_bias=False, name='q_projection', transpose_weights=True
+    )(act)
+    k = hm.Linear(
+        qkv_shape, use_bias=False, name='k_projection', transpose_weights=True
+    )(act)
+    v = hm.Linear(qkv_shape, use_bias=False, name='v_projection')(act)
+
+    q, k, v, bias, mask = _cue_triangle_attention_inputs(
+        q, k, v, bias, mask
+    )
+    cuex = _require_cuequivariance_jax(
+        flag='use_cue_triangle_attention'
+    )
+    weighted_avg, _, _ = cuex.triangle_attention(
+        q, k, v, bias, mask, qkv_dim ** -0.5
+    )
+    weighted_avg = _cue_triangle_attention_output(weighted_avg)
+    weighted_avg = jnp.reshape(weighted_avg, weighted_avg.shape[:-2] + (-1,))
+
+    gate_values = hm.Linear(
+        self.config.num_head * qkv_dim,
+        bias_init=1.0,
+        initializer='zeros',
+        transpose_weights=True,
+        name='gating_query',
+    )(act)
+    weighted_avg *= jax.nn.sigmoid(gate_values)
+
+    return hm.Linear(
+        num_channels,
+        initializer=self.global_config.final_init,
+        name='output_projection',
+    )(weighted_avg)
+
+  def __call__(self, act, pair_mask):
+    assert len(act.shape) == 3
+    assert len(pair_mask.shape) == 2
+
+    pair_mask = jnp.swapaxes(pair_mask, -1, -2)
+    act = hm.LayerNorm(name='act_norm')(act)
+
+    nonbatched_bias = hm.Linear(
+        self.config.num_head, use_bias=False, name='pair_bias_projection'
+    )(act)
+    nonbatched_bias = jnp.transpose(nonbatched_bias, [2, 0, 1])
+
+    num_residues = act.shape[0]
+    chunk_size = get_shard_size(
+        num_residues, self.global_config.pair_attention_chunk_size
+    )
+
+    if self.transpose:
+      act = jnp.swapaxes(act, -2, -3)
+
+    pair_mask = pair_mask[:, None, None, :].astype(jnp.bool_)
+    act = mapping.inference_subbatch(
+        self._attention,
+        chunk_size,
+        batched_args=[act, pair_mask],
+        nonbatched_args=[nonbatched_bias],
+    )
+
+    if self.transpose:
+      act = jnp.swapaxes(act, -2, -3)
+
+    return act
+
+
 class TriangleMultiplication(hk.Module):
   """Triangle Multiplication."""
 
@@ -329,6 +486,69 @@ class TriangleMultiplication(hk.Module):
     act *= jax.nn.sigmoid(gate_out)
 
     return act
+
+
+class CueTriangleMultiplication(hk.Module):
+  """Triangle Multiplication using cuEq's dense triangle update kernel."""
+
+  def __init__(
+      self,
+      config: TriangleMultiplication.Config,
+      global_config: model_config.GlobalConfig,
+      *,
+      name,
+  ):
+    super().__init__(name=name)
+    self.config = config
+    self.global_config = global_config
+
+  def __call__(self, act, mask):
+    num_channels = act.shape[-1]
+    norm_in_weight, norm_in_bias = _cue_layer_norm_params(
+        'left_norm_input', act
+    )
+    norm_out_weight, norm_out_bias = _cue_layer_norm_params(
+        'center_norm', act
+    )
+
+    p_in_weight, _ = hm.haiku_linear_get_params(
+        act, num_output=num_channels * 2, name='projection'
+    )
+    g_in_weight, _ = hm.haiku_linear_get_params(
+        act,
+        num_output=num_channels * 2,
+        initializer=self.global_config.final_init,
+        name='gate',
+    )
+    p_out_weight, _ = hm.haiku_linear_get_params(
+        act,
+        num_output=num_channels,
+        initializer=self.global_config.final_init,
+        name='output_projection',
+    )
+    g_out_weight, _ = hm.haiku_linear_get_params(
+        act,
+        num_output=num_channels,
+        initializer=self.global_config.final_init,
+        name='gating_linear',
+    )
+
+    cuex = _require_cuequivariance_jax(
+        flag='use_cue_triangle_multiplication'
+    )
+    return cuex.triangle_multiplicative_update(
+        x=act,
+        direction=_cue_triangle_direction(self.config.equation),
+        mask=jnp.asarray(mask, dtype=act.dtype),
+        norm_in_weight=norm_in_weight,
+        norm_in_bias=norm_in_bias,
+        p_in_weight=jnp.swapaxes(p_in_weight, -1, -2),
+        g_in_weight=jnp.swapaxes(g_in_weight, -1, -2),
+        norm_out_weight=norm_out_weight,
+        norm_out_bias=norm_out_bias,
+        p_out_weight=jnp.swapaxes(p_out_weight, -1, -2),
+        g_out_weight=jnp.swapaxes(g_out_weight, -1, -2),
+    )
 
 
 class OuterProductMean(hk.Module):
@@ -430,6 +650,8 @@ class PairFormerIteration(hk.Module):
         base_config.autocreate(equation='ikc,jkc->ijc')
     )
     shard_transition_blocks: bool = True
+    use_cue_triangle_multiplication: bool = False
+    use_cue_triangle_attention: bool = False
 
   def __init__(
       self,
@@ -465,26 +687,37 @@ class PairFormerIteration(hk.Module):
 
     num_residues = act.shape[0]
 
-    act += TriangleMultiplication(
+    triangle_multiplication = (
+        CueTriangleMultiplication
+        if self.config.use_cue_triangle_multiplication
+        else TriangleMultiplication
+    )
+    pair_attention = (
+        CueGridSelfAttention
+        if self.config.use_cue_triangle_attention
+        else GridSelfAttention
+    )
+
+    act += triangle_multiplication(
         self.config.triangle_multiplication_outgoing,
         self.global_config,
         name='triangle_multiplication_outgoing',
     )(act, pair_mask)
 
-    act += TriangleMultiplication(
+    act += triangle_multiplication(
         self.config.triangle_multiplication_incoming,
         self.global_config,
         name='triangle_multiplication_incoming',
     )(act, pair_mask)
 
-    act += GridSelfAttention(
+    act += pair_attention(
         self.config.pair_attention,
         self.global_config,
         name='pair_attention1',
         transpose=False,
     )(act, pair_mask)
 
-    act += GridSelfAttention(
+    act += pair_attention(
         self.config.pair_attention,
         self.global_config,
         name='pair_attention2',
