@@ -12,6 +12,7 @@
 
 from collections.abc import Sequence
 import importlib
+import os
 from typing import Literal
 
 from alphafold3.common import base_config
@@ -39,35 +40,33 @@ def _require_cuequivariance_jax(*, flag: str):
     ) from err
 
 
-def _cue_triangle_direction(
-    equation: Literal['ikc,jkc->ijc', 'kjc,kic->ijc'],
-) -> Literal['outgoing', 'incoming']:
-  return {
-      'ikc,jkc->ijc': 'outgoing',
-      'kjc,kic->ijc': 'incoming',
-  }[equation]
+def _require_cue_triangle_gemm_ops(*, flag: str):
+  """Imports cuEquivariance lower-level gated GEMM triangle helpers."""
+  _require_cuequivariance_jax(flag=flag)
+  try:
+    return importlib.import_module(
+        'cuequivariance_jax.triangle._sigmoid_gated_dual_gemm'
+    )
+  except (ImportError, OSError) as err:
+    raise ImportError(
+        f'{flag}=True requires cuEquivariance triangle gated GEMM helpers. '
+        'Ensure cuequivariance-jax and cuequivariance JAX CUDA ops are '
+        'installed and the Python environment CUDA shared libraries take '
+        'precedence on LD_LIBRARY_PATH.'
+    ) from err
 
 
-def _cue_layer_norm_params(name: str, act: jax.Array):
-  """Gets parameters with the same layout as hm.LayerNorm."""
-  dtype = (
-      jnp.float32 if act.dtype in (jnp.bfloat16, jnp.float16) else act.dtype
-  )
-  channels = act.shape[-1]
-  with hk.name_scope(name):
-    scale = hk.get_parameter(
-        'scale',
-        shape=(channels,),
-        dtype=dtype,
-        init=hk.initializers.Constant(1.0),
-    )
-    offset = hk.get_parameter(
-        'offset',
-        shape=(channels,),
-        dtype=dtype,
-        init=hk.initializers.Constant(0.0),
-    )
-  return scale, offset
+def _cue_triangle_gemm_fallback(
+    *, input_channels: int, output_channels: int
+) -> bool:
+  """Whether cuEquivariance gated GEMM should use its JAX fallback path."""
+  if os.environ.get('ALPHAFOLD3_CUE_GEMM_MODE', 'strict') != 'perf':
+    return True
+  try:
+    importlib.import_module('triton')
+  except ImportError:
+    return True
+  return input_channels % 32 != 0 or output_channels % 32 != 0
 
 
 def _cue_triangle_attention_inputs(q, k, v, bias, mask):
@@ -489,7 +488,7 @@ class TriangleMultiplication(hk.Module):
 
 
 class CueTriangleMultiplication(hk.Module):
-  """Triangle Multiplication using cuEq's dense triangle update kernel."""
+  """Triangle Multiplication using cuEq gated GEMM kernels where equivalent."""
 
   def __init__(
       self,
@@ -503,52 +502,104 @@ class CueTriangleMultiplication(hk.Module):
     self.global_config = global_config
 
   def __call__(self, act, mask):
+    mask = mask[None, ...]
     num_channels = act.shape[-1]
-    norm_in_weight, norm_in_bias = _cue_layer_norm_params(
-        'left_norm_input', act
-    )
-    norm_out_weight, norm_out_bias = _cue_layer_norm_params(
-        'center_norm', act
-    )
+    equation = {
+        'ikc,jkc->ijc': 'cik,cjk->cij',
+        'kjc,kic->ijc': 'ckj,cki->cij',
+    }[self.config.equation]
 
-    p_in_weight, _ = hm.haiku_linear_get_params(
-        act, num_output=num_channels * 2, name='projection'
-    )
-    g_in_weight, _ = hm.haiku_linear_get_params(
-        act,
-        num_output=num_channels * 2,
-        initializer=self.global_config.final_init,
-        name='gate',
-    )
-    p_out_weight, _ = hm.haiku_linear_get_params(
-        act,
-        num_output=num_channels,
-        initializer=self.global_config.final_init,
-        name='output_projection',
-    )
-    g_out_weight, _ = hm.haiku_linear_get_params(
-        act,
-        num_output=num_channels,
-        initializer=self.global_config.final_init,
-        name='gating_linear',
-    )
+    act = hm.LayerNorm(name='left_norm_input')(act)
+    input_act = act
 
-    cuex = _require_cuequivariance_jax(
-        flag='use_cue_triangle_multiplication'
-    )
-    return cuex.triangle_multiplicative_update(
-        x=act,
-        direction=_cue_triangle_direction(self.config.equation),
-        mask=jnp.asarray(mask, dtype=act.dtype),
-        norm_in_weight=norm_in_weight,
-        norm_in_bias=norm_in_bias,
-        p_in_weight=jnp.swapaxes(p_in_weight, -1, -2),
-        g_in_weight=jnp.swapaxes(g_in_weight, -1, -2),
-        norm_out_weight=norm_out_weight,
-        norm_out_bias=norm_out_bias,
-        p_out_weight=jnp.swapaxes(p_out_weight, -1, -2),
-        g_out_weight=jnp.swapaxes(g_out_weight, -1, -2),
-    )
+    if self.config.use_glu_kernel:
+      cue_fallback = _cue_triangle_gemm_fallback(
+          input_channels=num_channels, output_channels=num_channels * 2
+      )
+      weights_projection, _ = hm.haiku_linear_get_params(
+          act, num_output=num_channels * 2, name='projection'
+      )
+      weights_gate, _ = hm.haiku_linear_get_params(
+          act,
+          num_output=num_channels * 2,
+          initializer=self.global_config.final_init,
+          name='gate',
+      )
+      cue_gemm = _require_cue_triangle_gemm_ops(
+          flag='use_cue_triangle_multiplication'
+      )
+      projection = cue_gemm.sigmoid_gated_dual_gemm(
+          act,
+          jnp.swapaxes(weights_gate, -1, -2),
+          jnp.swapaxes(weights_projection, -1, -2),
+          fallback=cue_fallback,
+      )
+      projection = jnp.transpose(projection, (2, 0, 1))
+      projection *= mask
+    else:
+      projection = hm.Linear(num_channels * 2, name='projection')(act)
+      projection = jnp.transpose(projection, (2, 0, 1))
+      projection *= mask
+
+      gate = hm.Linear(
+          num_channels * 2,
+          name='gate',
+          bias_init=1.0,
+          initializer=self.global_config.final_init,
+      )(act)
+      gate = jnp.transpose(gate, (2, 0, 1))
+      projection *= jax.nn.sigmoid(gate)
+
+    projection = projection.reshape(num_channels, 2, *projection.shape[1:])
+    a, b = jnp.split(projection, 2, axis=1)
+    a, b = jnp.squeeze(a, axis=1), jnp.squeeze(b, axis=1)
+    act = jnp.einsum(equation, a, b)
+    act = hm.LayerNorm(name='center_norm', axis=0, param_axis=0)(act)
+
+    act = jnp.transpose(act, (1, 2, 0))
+
+    if self.config.use_glu_kernel:
+      cue_fallback = _cue_triangle_gemm_fallback(
+          input_channels=num_channels, output_channels=num_channels
+      )
+      weights_projection, _ = hm.haiku_linear_get_params(
+          act,
+          num_output=num_channels,
+          initializer=self.global_config.final_init,
+          name='output_projection',
+      )
+      weights_gate, _ = hm.haiku_linear_get_params(
+          input_act,
+          num_output=num_channels,
+          initializer=self.global_config.final_init,
+          name='gating_linear',
+      )
+      cue_gemm = _require_cue_triangle_gemm_ops(
+          flag='use_cue_triangle_multiplication'
+      )
+      act = cue_gemm.sigmoid_gated_dual_gemm_dual_x(
+          input_act,
+          act,
+          jnp.swapaxes(weights_gate, -1, -2),
+          jnp.swapaxes(weights_projection, -1, -2),
+          fallback=cue_fallback,
+      )
+    else:
+      act = hm.Linear(
+          num_channels,
+          initializer=self.global_config.final_init,
+          name='output_projection',
+      )(act)
+
+      gate_out = hm.Linear(
+          num_channels,
+          name='gating_linear',
+          bias_init=1.0,
+          initializer=self.global_config.final_init,
+      )(input_act)
+      act *= jax.nn.sigmoid(gate_out)
+
+    return act
 
 
 class OuterProductMean(hk.Module):

@@ -1,3 +1,9 @@
-# Ignore large pickle files in converters
-src/alphafold3/constants/converters/*.pickle
-src/alphafold3/constants/converters/ccd.pickle
+# Python/runtime artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Generated converter outputs. Keep converter scripts tracked, but do not track
+# large generated pickle payloads.
+/constants/converters/*.pickle
+/constants/converters/*.pkl
